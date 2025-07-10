@@ -8,6 +8,7 @@ from typing import Generator, List, Optional, Union
 
 from PIL import Image
 
+from sahi.postprocess.interface import IPostProcessor
 from sahi.utils.import_utils import is_available
 
 # TODO: This does nothing for this module. The issue named here does not exist
@@ -30,7 +31,7 @@ from sahi.postprocess.combine import (
     PostprocessPredictions,
 )
 from sahi.prediction import ObjectPrediction, PredictionResult
-from sahi.slicing import slice_image
+from sahi.slicing import slice_image, slice_image_v2
 from sahi.utils.coco import Coco, CocoImage
 from sahi.utils.cv import (
     IMAGE_EXTENSIONS,
@@ -64,6 +65,246 @@ def filter_predictions(object_prediction_list, exclude_classes_by_name, exclude_
         if obj_pred.category.name not in (exclude_classes_by_name or [])
         and obj_pred.category.id not in (exclude_classes_by_id or [])
     ]
+
+
+def get_prediction_v2(
+    image,
+    detection_model,
+    shift_amount: list = [0, 0],
+    full_shape=None,
+    verbose: int = 0,
+    exclude_classes_by_name: Optional[List[str]] = None,
+    exclude_classes_by_id: Optional[List[int]] = None,
+) -> PredictionResult:
+    """
+    Function for performing prediction for given image using given detection_model.
+
+    Arguments:
+        image: np.ndarray
+            numpy image matrix to slice in RGB format
+        detection_model: model.DetectionMode
+        shift_amount: List
+            To shift the box and mask predictions from sliced image to full
+            sized image, should be in the form of [shift_x, shift_y]
+        full_shape: List
+            Size of the full image, should be in the form of [height, width]
+        verbose: int
+            0: no print (default)
+            1: print prediction duration
+        exclude_classes_by_name: Optional[List[str]]
+            None: if no classes are excluded
+            List[str]: set of classes to exclude using its/their class label name/s
+        exclude_classes_by_id: Optional[List[int]]
+            None: if no classes are excluded
+            List[int]: set of classes to exclude using one or more IDs
+    Returns:
+        A dict with fields:
+            object_prediction_list: a list of ObjectPrediction
+            durations_in_seconds: a dict containing elapsed times for profiling
+    """
+    durations_in_seconds = dict()
+
+    # get prediction
+    time_start = time.time()
+    detection_model.perform_inference(np.ascontiguousarray(image))
+    time_end = time.time() - time_start
+    durations_in_seconds["prediction"] = time_end
+
+    if full_shape is None:
+        full_shape = image.shape[:2]
+
+    # process prediction
+    time_start = time.time()
+    # works only with 1 batch
+    detection_model.convert_original_predictions(
+        shift_amount=shift_amount,
+        full_shape=full_shape,
+    )
+    object_prediction_list: List[ObjectPrediction] = detection_model.object_prediction_list
+    object_prediction_list = filter_predictions(object_prediction_list, exclude_classes_by_name, exclude_classes_by_id)
+
+    if verbose == 1:
+        print(
+            "Prediction performed in",
+            durations_in_seconds["prediction"],
+            "seconds.",
+        )
+
+    return PredictionResult(
+        image=image, object_prediction_list=object_prediction_list, durations_in_seconds=durations_in_seconds
+    )
+
+
+def get_sliced_prediction_v2(
+    image,
+    post_processor: IPostProcessor,
+    detection_model,
+    slice_height: Optional[int] = None,
+    slice_width: Optional[int] = None,
+    overlap_height_ratio: float = 0.2,
+    overlap_width_ratio: float = 0.2,
+    perform_standard_pred: bool = True,
+    verbose: int = 1,
+    merge_buffer_length: Optional[int] = None,
+    auto_slice_resolution: bool = True,
+    exclude_classes_by_name: Optional[List[str]] = None,
+    exclude_classes_by_id: Optional[List[int]] = None,
+) -> PredictionResult:
+    """
+    Function for slice image + get prediction for each slice + combine predictions in full image.
+
+    Args:
+        image: str or np.ndarray
+            Location of image or numpy image matrix to slice
+        detection_model: model.DetectionModel
+        postprocess_type: sahi.postprocess.interface.IPostProcessor
+            Post processor to be used after sliced inference while merging/eliminating predictions.
+        slice_height: int
+            Height of each slice.  Defaults to ``None``.
+        slice_width: int
+            Width of each slice.  Defaults to ``None``.
+        overlap_height_ratio: float
+            Fractional overlap in height of each window (e.g. an overlap of 0.2 for a window
+            of size 512 yields an overlap of 102 pixels).
+            Default to ``0.2``.
+        overlap_width_ratio: float
+            Fractional overlap in width of each window (e.g. an overlap of 0.2 for a window
+            of size 512 yields an overlap of 102 pixels).
+            Default to ``0.2``.
+        perform_standard_pred: bool
+            Perform a standard prediction on top of sliced predictions to increase large object
+            detection accuracy. Default: True.
+        verbose: int
+            0: no print
+            1: print number of slices (default)
+            2: print number of slices and slice/prediction durations
+        merge_buffer_length: int
+            The length of buffer for slices to be used during sliced prediction, which is suitable for low memory.
+            It may affect the AP if it is specified. The higher the amount, the closer results to the non-buffered.
+            scenario. See [the discussion](https://github.com/obss/sahi/pull/445).
+        auto_slice_resolution: bool
+            if slice parameters (slice_height, slice_width) are not given,
+            it enables automatically calculate these params from image resolution and orientation.
+        exclude_classes_by_name: Optional[List[str]]
+            None: if no classes are excluded
+            List[str]: set of classes to exclude using its/their class label name/s
+        exclude_classes_by_id: Optional[List[int]]
+            None: if no classes are excluded
+            List[int]: set of classes to exclude using one or more IDs
+    Returns:
+        A Dict with fields:
+            object_prediction_list: a list of sahi.prediction.ObjectPrediction
+            durations_in_seconds: a dict containing elapsed times for profiling
+    """
+
+    # for profiling
+    durations_in_seconds = dict()
+
+    # currently only 1 batch supported
+    num_batch = 1
+    # create slices from full image
+    time_start = time.time()
+    slice_image_result = slice_image_v2(
+        image=image,
+        slice_height=slice_height,
+        slice_width=slice_width,
+        overlap_height_ratio=overlap_height_ratio,
+        overlap_width_ratio=overlap_width_ratio,
+        auto_slice_resolution=auto_slice_resolution,
+    )
+    from sahi.models.ultralytics import UltralyticsDetectionModel
+
+    num_slices = len(slice_image_result)
+    time_end = time.time() - time_start
+    durations_in_seconds["slice"] = time_end
+
+    if isinstance(detection_model, UltralyticsDetectionModel) and detection_model.is_obb:
+        raise ValueError("Only NMS is supported for OBB model outputs")
+
+    postprocess_time = 0
+    time_start = time.time()
+
+    # create prediction input
+    num_group = int(num_slices / num_batch)
+    if verbose == 1 or verbose == 2:
+        tqdm.write(f"Performing prediction on {num_slices} slices.")
+    object_prediction_list = []
+    # perform sliced prediction
+    for group_ind in range(num_group):
+        # prepare batch (currently supports only 1 batch)
+        image_list = []
+        shift_amount_list = []
+        for image_ind in range(num_batch):
+            image_list.append(slice_image_result.images[group_ind * num_batch + image_ind])
+            shift_amount_list.append(slice_image_result.starting_pixels[group_ind * num_batch + image_ind])
+        # perform batch prediction
+        prediction_result = get_prediction_v2(
+            image=image_list[0],
+            detection_model=detection_model,
+            shift_amount=shift_amount_list[0],
+            full_shape=[
+                slice_image_result.original_image_height,
+                slice_image_result.original_image_width,
+            ],
+            exclude_classes_by_name=exclude_classes_by_name,
+            exclude_classes_by_id=exclude_classes_by_id,
+        )
+        # convert sliced predictions to full predictions
+        for object_prediction in prediction_result.object_prediction_list:
+            if object_prediction:  # if not empty
+                object_prediction_list.append(object_prediction.get_shifted_object_prediction())
+
+        # merge matching predictions during sliced prediction
+        if merge_buffer_length is not None and len(object_prediction_list) > merge_buffer_length:
+            postprocess_time_start = time.time()
+            object_prediction_list = post_processor(object_prediction_list)
+            postprocess_time += time.time() - postprocess_time_start
+
+    # perform standard prediction
+    if num_slices > 1 and perform_standard_pred:
+        prediction_result = get_prediction_v2(
+            image=image,
+            detection_model=detection_model,
+            shift_amount=[0, 0],
+            full_shape=[
+                slice_image_result.original_image_height,
+                slice_image_result.original_image_width,
+            ],
+            exclude_classes_by_name=exclude_classes_by_name,
+            exclude_classes_by_id=exclude_classes_by_id,
+        )
+        object_prediction_list.extend(prediction_result.object_prediction_list)
+
+    # merge matching predictions
+    if len(object_prediction_list) > 1:
+        postprocess_time_start = time.time()
+        object_prediction_list = post_processor(object_prediction_list)
+        postprocess_time += time.time() - postprocess_time_start
+
+    time_end = time.time() - time_start
+    durations_in_seconds["prediction"] = time_end - postprocess_time
+    durations_in_seconds["postprocess"] = postprocess_time
+
+    if verbose == 2:
+        print(
+            "Slicing performed in",
+            durations_in_seconds["slice"],
+            "seconds.",
+        )
+        print(
+            "Prediction performed in",
+            durations_in_seconds["prediction"],
+            "seconds.",
+        )
+        print(
+            "Postprocessing performed in",
+            durations_in_seconds["postprocess"],
+            "seconds.",
+        )
+
+    return PredictionResult(
+        image=image, object_prediction_list=object_prediction_list, durations_in_seconds=durations_in_seconds
+    )
 
 
 def get_prediction(

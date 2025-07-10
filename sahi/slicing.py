@@ -263,6 +263,93 @@ class SliceImageResult:
         return len(self._sliced_image_list)
 
 
+def slice_image_v2(
+    image: np.ndarray,
+    slice_height: Optional[int] = None,
+    slice_width: Optional[int] = None,
+    overlap_height_ratio: Optional[float] = 0.2,
+    overlap_width_ratio: Optional[float] = 0.2,
+    auto_slice_resolution: Optional[bool] = True,
+    verbose: Optional[bool] = False,
+) -> SliceImageResult:
+    """Slice a large image into smaller windows. If output_file_name and output_dir is given, export
+    sliced images.
+
+    Args:
+        image (np.ndarray): Image to be sliced in RGB format.
+        coco_annotation_list (List[CocoAnnotation], optional): List of CocoAnnotation objects.
+        slice_height (int, optional): Height of each slice. Default None.
+        slice_width (int, optional): Width of each slice. Default None.
+        overlap_height_ratio (float, optional): Fractional overlap in height of each
+            slice (e.g. an overlap of 0.2 for a slice of size 100 yields an
+            overlap of 20 pixels). Default 0.2.
+        overlap_width_ratio (float, optional): Fractional overlap in width of each
+            slice (e.g. an overlap of 0.2 for a slice of size 100 yields an
+            overlap of 20 pixels). Default 0.2.
+        auto_slice_resolution (bool, optional): if not set slice parameters such as slice_height and slice_width,
+            it enables automatically calculate these params from image resolution and orientation.
+        min_area_ratio (float, optional): If the cropped annotation area to original annotation
+            ratio is smaller than this value, the annotation is filtered out. Default 0.1.
+        verbose (bool, optional): Switch to print relevant values to screen.
+            Default 'False'.
+
+    Returns:
+        sliced_image_result: SliceImageResult:
+                                sliced_image_list: list of SlicedImage
+                                image_dir: str
+                                    Directory of the sliced image exports.
+                                original_image_size: list of int
+                                    Size of the unsliced original image in [height, width]
+    """
+    # define verboseprint
+    verboselog = logger.info if verbose else lambda *a, **k: None
+
+    # read image
+    image_height, image_width = image.shape[:2]
+    size = (image_width, image_height)
+    verboselog("image.shape: " + str(size))
+
+    if not (image_width != 0 and image_height != 0):
+        raise RuntimeError(f"invalid image size: {size} for 'slice_image'.")
+    slice_bboxes = get_slice_bboxes(
+        image_height=image_height,
+        image_width=image_width,
+        auto_slice_resolution=auto_slice_resolution,
+        slice_height=slice_height,
+        slice_width=slice_width,
+        overlap_height_ratio=overlap_height_ratio,
+        overlap_width_ratio=overlap_width_ratio,
+    )
+
+    n_ims = 0
+
+    # init images and annotations lists
+    sliced_image_result = SliceImageResult(original_image_size=[image_height, image_width])
+
+    # iterate over slices
+    for slice_bbox in slice_bboxes:
+        n_ims += 1
+
+        # extract image
+        tlx = slice_bbox[0]
+        tly = slice_bbox[1]
+        brx = slice_bbox[2]
+        bry = slice_bbox[3]
+        image_pil_slice = image[tly:bry, tlx:brx]
+
+        # create sliced image and append to sliced_image_result
+        sliced_image = SlicedImage(
+            image=image_pil_slice, coco_image=None, starting_pixel=[slice_bbox[0], slice_bbox[1]]
+        )
+        sliced_image_result.add_sliced_image(sliced_image)
+
+    verboselog(
+        "Num slices: " + str(n_ims) + " slice_height: " + str(slice_height) + " slice_width: " + str(slice_width)
+    )
+
+    return sliced_image_result
+
+
 def slice_image(
     image: Union[str, Image.Image],
     coco_annotation_list: Optional[List[CocoAnnotation]] = None,
